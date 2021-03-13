@@ -35,6 +35,9 @@ import time
 import json
 import sys
 import re
+import io
+import discord
+from discord.opus import Encoder
 
 from .errors import ClientException
 from .opus import Encoder as OpusEncoder
@@ -171,44 +174,10 @@ class FFmpegAudio(AudioSource):
 
         self._process = self._stdout = None
 
-class FFmpegPCMAudio(FFmpegAudio):
-    """An audio source from FFmpeg (or AVConv).
-
-    This launches a sub-process to a specific input file given.
-
-    .. warning::
-
-        You must have the ffmpeg or avconv executable in your path environment
-        variable in order for this to work.
-
-    Parameters
-    ------------
-    source: Union[:class:`str`, :class:`io.BufferedIOBase`]
-        The input that ffmpeg will take and convert to PCM bytes.
-        If ``pipe`` is ``True`` then this is a file-like object that is
-        passed to the stdin of ffmpeg.
-    executable: :class:`str`
-        The executable name (and path) to use. Defaults to ``ffmpeg``.
-    pipe: :class:`bool`
-        If ``True``, denotes that ``source`` parameter will be passed
-        to the stdin of ffmpeg. Defaults to ``False``.
-    stderr: Optional[:term:`py:file object`]
-        A file-like object to pass to the Popen constructor.
-        Could also be an instance of ``subprocess.PIPE``.
-    before_options: Optional[:class:`str`]
-        Extra command line arguments to pass to ffmpeg before the ``-i`` flag.
-    options: Optional[:class:`str`]
-        Extra command line arguments to pass to ffmpeg after the ``-i`` flag.
-
-    Raises
-    --------
-    ClientException
-        The subprocess failed to be created.
-    """
-
+class FFmpegPCMAudio(AudioSource):
     def __init__(self, source, *, executable='ffmpeg', pipe=False, stderr=None, before_options=None, options=None):
-        args = []
-        subprocess_kwargs = {'stdin': source if pipe else subprocess.DEVNULL, 'stderr': stderr}
+        stdin = None if not pipe else source
+        args = [executable]
 
         if isinstance(before_options, str):
             args.extend(shlex.split(before_options))
@@ -219,19 +188,33 @@ class FFmpegPCMAudio(FFmpegAudio):
 
         if isinstance(options, str):
             args.extend(shlex.split(options))
-
+    
         args.append('pipe:1')
-
-        super().__init__(source, executable=executable, args=args, **subprocess_kwargs)
+        self._process = None
+        try:
+            self._process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr)
+            self._stdout = io.BytesIO(self._process.communicate(input=stdin)[0])
+        except FileNotFoundError:
+            raise discord.ClientException(executable + ' was not found.') from None
+        except subprocess.SubprocessError as exc:
+            raise discord.ClientException('Popen failed: {0.__class__.__name__}: {0}'.format(exc)) from exc
 
     def read(self):
-        ret = self._stdout.read(OpusEncoder.FRAME_SIZE)
-        if len(ret) != OpusEncoder.FRAME_SIZE:
+        ret = self._stdout.read(Encoder.FRAME_SIZE)
+        if len(ret) != Encoder.FRAME_SIZE:
             return b''
         return ret
 
-    def is_opus(self):
-        return False
+    def cleanup(self):
+        proc = self._process
+        if proc is None:
+            return
+        proc.kill()
+        if proc.poll() is None:
+            proc.communicate()
+        
+        self._process = None
+
 
 class FFmpegOpusAudio(FFmpegAudio):
     """An audio source from FFmpeg (or AVConv).
