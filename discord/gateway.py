@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
-
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2020 Rapptz
+Copyright (c) 2015-present Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -162,8 +160,8 @@ class KeepAliveHandler(threading.Thread):
                         except KeyError:
                             msg = self.block_msg
                         else:
-                            stack = traceback.format_stack(frame)
-                            msg = '%s\nLoop thread traceback (most recent call last):\n%s' % (self.block_msg, ''.join(stack))
+                            stack = ''.join(traceback.format_stack(frame))
+                            msg = f'{self.block_msg}\nLoop thread traceback (most recent call last):\n{stack}'
                         log.warning(msg, self.shard_id, total)
 
             except Exception:
@@ -375,13 +373,9 @@ class DiscordWebSocket:
                 },
                 'compress': True,
                 'large_threshold': 250,
-                'guild_subscriptions': self._connection.guild_subscriptions,
                 'v': 3
             }
         }
-
-        if not self._connection.is_bot:
-            payload['d']['synced_guilds'] = []
 
         if self.shard_id is not None and self.shard_count is not None:
             payload['d']['shard'] = [self.shard_id, self.shard_count]
@@ -422,16 +416,11 @@ class DiscordWebSocket:
         if type(msg) is bytes:
             self._buffer.extend(msg)
 
-            if len(msg) >= 4:
-                if msg[-4:] == b'\x00\x00\xff\xff':
-                    msg = self._zlib.decompress(self._buffer)
-                    msg = msg.decode('utf-8')
-                    self._buffer = bytearray()
-                else:
-                    return
-            else:
+            if len(msg) < 4 or msg[-4:] != b'\x00\x00\xff\xff':
                 return
-
+            msg = self._zlib.decompress(self._buffer)
+            msg = msg.decode('utf-8')
+            self._buffer = bytearray()
         msg = json.loads(msg)
 
         log.debug('For Shard ID %s: WebSocket Event: %s', self.shard_id, msg)
@@ -610,7 +599,9 @@ class DiscordWebSocket:
         if activity is not None:
             if not isinstance(activity, BaseActivity):
                 raise InvalidArgument('activity must derive from BaseActivity.')
-            activity = activity.to_dict()
+            activity = [activity.to_dict()]
+        else:
+            activity = []
 
         if status == 'idle':
             since = int(time.time() * 1000)
@@ -618,7 +609,7 @@ class DiscordWebSocket:
         payload = {
             'op': self.PRESENCE,
             'd': {
-                'game': activity,
+                'activities': activity,
                 'afk': afk,
                 'since': since,
                 'status': status
@@ -629,18 +620,12 @@ class DiscordWebSocket:
         log.debug('Sending "%s" to change status', sent)
         await self.send(sent)
 
-    async def request_sync(self, guild_ids):
-        payload = {
-            'op': self.GUILD_SYNC,
-            'd': list(guild_ids)
-        }
-        await self.send_as_json(payload)
-
-    async def request_chunks(self, guild_id, query=None, *, limit, user_ids=None, nonce=None):
+    async def request_chunks(self, guild_id, query=None, *, limit, user_ids=None, presences=False, nonce=None):
         payload = {
             'op': self.REQUEST_MEMBERS,
             'd': {
                 'guild_id': guild_id,
+                'presences': presences,
                 'limit': limit
             }
         }
@@ -723,13 +708,18 @@ class DiscordVoiceWebSocket:
     CLIENT_CONNECT      = 12
     CLIENT_DISCONNECT   = 13
 
-    def __init__(self, socket, loop):
+    def __init__(self, socket, loop, *, hook=None):
         self.ws = socket
         self.loop = loop
         self._keep_alive = None
         self._close_code = None
         self.secret_key = None
+        if hook:
+            self._hook = hook
 
+    async def _hook(self, *args):
+        pass
+    
     async def send_as_json(self, data):
         log.debug('Sending voice websocket frame: %s.', data)
         await self.ws.send_str(utils.to_json(data))
@@ -762,12 +752,12 @@ class DiscordVoiceWebSocket:
         await self.send_as_json(payload)
 
     @classmethod
-    async def from_client(cls, client, *, resume=False):
+    async def from_client(cls, client, *, resume=False, hook=None):
         """Creates a voice websocket for the :class:`VoiceClient`."""
         gateway = 'wss://' + client.endpoint + '/?v=4'
         http = client._state.http
         socket = await http.ws_connect(gateway, compress=15)
-        ws = cls(socket, loop=client.loop)
+        ws = cls(socket, loop=client.loop, hook=hook)
         ws.gateway = gateway
         ws._connection = client
         ws._max_heartbeat_timeout = 60.0
@@ -834,6 +824,8 @@ class DiscordVoiceWebSocket:
             interval = data['heartbeat_interval'] / 1000.0
             self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
             self._keep_alive.start()
+            
+        await self._hook(self, msg)
 
     async def initial_connection(self, data):
         state = self._connection
@@ -875,7 +867,7 @@ class DiscordVoiceWebSocket:
     def average_latency(self):
         """:class:`list`: Average of last 20 HEARTBEAT latencies."""
         heartbeat = self._keep_alive
-        if heartbeat is None:
+        if heartbeat is None or not heartbeat.recent_ack_latencies:
             return float('inf')
 
         return sum(heartbeat.recent_ack_latencies) / len(heartbeat.recent_ack_latencies)

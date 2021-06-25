@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
-
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2020 Rapptz
+Copyright (c) 2015-present Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -24,17 +22,24 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Union,
+)
 import asyncio
 import functools
 import inspect
-import typing
 import datetime
+import types
 
 import discord
 
 from .errors import *
-from .cooldowns import Cooldown, BucketType, CooldownMapping, MaxConcurrency
-from . import converter as converters
+from .cooldowns import Cooldown, BucketType, CooldownMapping, MaxConcurrency, DynamicCooldownMapping
+from .converter import run_converters, get_converter, Greedy
 from ._types import _BaseCommand
 from .cog import Cog
 
@@ -55,6 +60,7 @@ __all__ = (
     'bot_has_permissions',
     'bot_has_any_role',
     'cooldown',
+    'dynamic_cooldown',
     'max_concurrency',
     'dm_only',
     'guild_only',
@@ -63,6 +69,40 @@ __all__ = (
     'has_guild_permissions',
     'bot_has_guild_permissions'
 )
+
+def unwrap_function(function: Callable[..., Any]) -> Callable[..., Any]:
+    partial = functools.partial
+    while True:
+        if hasattr(function, '__wrapped__'):
+            function = function.__wrapped__
+        elif isinstance(function, partial):
+            function = function.func
+        else:
+            return function
+
+
+def get_signature_parameters(function: Callable[..., Any], globalns: Dict[str, Any]) -> Dict[str, inspect.Parameter]:
+    signature = inspect.signature(function)
+    params = {}
+    cache: Dict[str, Any] = {}
+    eval_annotation = discord.utils.evaluate_annotation
+    for name, parameter in signature.parameters.items():
+        annotation = parameter.annotation
+        if annotation is parameter.empty:
+            params[name] = parameter
+            continue
+        if annotation is None:
+            params[name] = parameter.replace(annotation=type(None))
+            continue
+
+        annotation = eval_annotation(annotation, globalns, globalns, cache)
+        if annotation is Greedy:
+            raise TypeError('Unparameterized Greedy[...] is disallowed in signature.')
+
+        params[name] = parameter.replace(annotation=annotation)
+
+    return params
+
 
 def wrap_callback(coro):
     @functools.wraps(coro)
@@ -100,14 +140,6 @@ def hooked_wrapped_callback(command, ctx, coro):
         return ret
     return wrapped
 
-def _convert_to_bool(argument):
-    lowered = argument.lower()
-    if lowered in ('yes', 'y', 'true', 't', '1', 'enable', 'on'):
-        return True
-    elif lowered in ('no', 'n', 'false', 'f', '0', 'disable', 'off'):
-        return False
-    else:
-        raise BadBoolArgument(lowered)
 
 class _CaseInsensitiveDict(dict):
     def __contains__(self, k):
@@ -144,7 +176,7 @@ class Command(_BaseCommand):
         The long help text for the command.
     brief: Optional[:class:`str`]
         The short help text for the command.
-    usage: :class:`str`
+    usage: Optional[:class:`str`]
         A replacement for arguments in the default help text.
     aliases: Union[List[:class:`str`], Tuple[:class:`str`]]
         The list of aliases the command can be invoked under.
@@ -153,12 +185,12 @@ class Command(_BaseCommand):
         If the command is invoked while it is disabled, then
         :exc:`.DisabledCommand` is raised to the :func:`.on_command_error`
         event. Defaults to ``True``.
-    parent: Optional[:class:`Command`]
-        The parent command that this command belongs to. ``None`` if there
+    parent: Optional[:class:`Group`]
+        The parent group that this command belongs to. ``None`` if there
         isn't one.
     cog: Optional[:class:`Cog`]
         The cog that this command belongs to. ``None`` if there isn't one.
-    checks: List[Callable[..., :class:`bool`]]
+    checks: List[Callable[[:class:`.Context`], :class:`bool`]]
         A list of predicates that verifies if the command could be executed
         with the given :class:`.Context` as the sole parameter. If an exception
         is necessary to be thrown to signal failure, then one inherited from
@@ -194,6 +226,14 @@ class Command(_BaseCommand):
         If ``True``\, cooldown processing is done after argument parsing,
         which calls converters. If ``False`` then cooldown processing is done
         first and then the converters are called second. Defaults to ``False``.
+    extras: :class:`dict`
+        A dict of user provided extras to attach to the Command. 
+        
+        .. note::
+            This object may be copied by the library.
+
+
+        .. versionadded:: 2.0
     """
 
     def __new__(cls, *args, **kwargs):
@@ -237,6 +277,7 @@ class Command(_BaseCommand):
         self.usage = kwargs.get('usage')
         self.rest_is_raw = kwargs.get('rest_is_raw', False)
         self.aliases = kwargs.get('aliases', [])
+        self.extras = kwargs.get('extras', {})
 
         if not isinstance(self.aliases, (list, tuple)):
             raise TypeError("Aliases of a command must be a list or a tuple of strings.")
@@ -257,7 +298,10 @@ class Command(_BaseCommand):
         except AttributeError:
             cooldown = kwargs.get('cooldown')
         finally:
-            self._buckets = CooldownMapping(cooldown)
+            if cooldown is None:
+                self._buckets = CooldownMapping(cooldown, BucketType.default)
+            elif isinstance(cooldown, CooldownMapping):
+                self._buckets = cooldown
 
         try:
             max_concurrency = func.__commands_max_concurrency__
@@ -296,21 +340,15 @@ class Command(_BaseCommand):
     @callback.setter
     def callback(self, function):
         self._callback = function
-        self.module = function.__module__
+        unwrap = unwrap_function(function)
+        self.module = unwrap.__module__
 
-        signature = inspect.signature(function)
-        self.params = signature.parameters.copy()
+        try:
+            globalns = unwrap.__globals__
+        except AttributeError:
+            globalns = {}
 
-        # PEP-563 allows postponing evaluation of annotations with a __future__
-        # import. When postponed, Parameter.annotation will be a string and must
-        # be replaced with the real value for the converters to work later on
-        for key, value in self.params.items():
-            if isinstance(value.annotation, str):
-                self.params[key] = value = value.replace(annotation=eval(value.annotation, function.__globals__))
-
-            # fail early for when someone passes an unparameterized Greedy type
-            if value.annotation is converters.Greedy:
-                raise TypeError('Unparameterized Greedy[...] is disallowed in signature.')
+        self.params = get_signature_parameters(function, globalns)
 
     def add_check(self, func):
         """Adds a check to the command.
@@ -432,98 +470,17 @@ class Command(_BaseCommand):
         finally:
             ctx.bot.dispatch('command_error', ctx, error)
 
-    async def _actual_conversion(self, ctx, converter, argument, param):
-        if converter is bool:
-            return _convert_to_bool(argument)
-
-        try:
-            module = converter.__module__
-        except AttributeError:
-            pass
-        else:
-            if module is not None and (module.startswith('discord.') and not module.endswith('converter')):
-                converter = getattr(converters, converter.__name__ + 'Converter', converter)
-
-        try:
-            if inspect.isclass(converter):
-                if issubclass(converter, converters.Converter):
-                    instance = converter()
-                    ret = await instance.convert(ctx, argument)
-                    return ret
-                else:
-                    method = getattr(converter, 'convert', None)
-                    if method is not None and inspect.ismethod(method):
-                        ret = await method(ctx, argument)
-                        return ret
-            elif isinstance(converter, converters.Converter):
-                ret = await converter.convert(ctx, argument)
-                return ret
-        except CommandError:
-            raise
-        except Exception as exc:
-            raise ConversionError(converter, exc) from exc
-
-        try:
-            return converter(argument)
-        except CommandError:
-            raise
-        except Exception as exc:
-            try:
-                name = converter.__name__
-            except AttributeError:
-                name = converter.__class__.__name__
-
-            raise BadArgument('Converting to "{}" failed for parameter "{}".'.format(name, param.name)) from exc
-
-    async def do_conversion(self, ctx, converter, argument, param):
-        try:
-            origin = converter.__origin__
-        except AttributeError:
-            pass
-        else:
-            if origin is typing.Union:
-                errors = []
-                _NoneType = type(None)
-                for conv in converter.__args__:
-                    # if we got to this part in the code, then the previous conversions have failed
-                    # so we should just undo the view, return the default, and allow parsing to continue
-                    # with the other parameters
-                    if conv is _NoneType and param.kind != param.VAR_POSITIONAL:
-                        ctx.view.undo()
-                        return None if param.default is param.empty else param.default
-
-                    try:
-                        value = await self._actual_conversion(ctx, conv, argument, param)
-                    except CommandError as exc:
-                        errors.append(exc)
-                    else:
-                        return value
-
-                # if we're  here, then we failed all the converters
-                raise BadUnionArgument(param, converter.__args__, errors)
-
-        return await self._actual_conversion(ctx, converter, argument, param)
-
-    def _get_converter(self, param):
-        converter = param.annotation
-        if converter is param.empty:
-            if param.default is not param.empty:
-                converter = str if param.default is None else type(param.default)
-            else:
-                converter = str
-        return converter
-
     async def transform(self, ctx, param):
         required = param.default is param.empty
-        converter = self._get_converter(param)
+        converter = get_converter(param)
         consume_rest_is_special = param.kind == param.KEYWORD_ONLY and not self.rest_is_raw
         view = ctx.view
         view.skip_ws()
 
         # The greedy converter is simple -- it keeps going until it fails in which case,
         # it undos the view ready for the next parameter to use instead
-        if type(converter) is converters._Greedy:
-            if param.kind == param.POSITIONAL_OR_KEYWORD:
+        if isinstance(converter, Greedy):
+            if param.kind in (param.POSITIONAL_OR_KEYWORD, param.POSITIONAL_ONLY):
                 return await self._transform_greedy_pos(ctx, param, required, converter.converter)
             elif param.kind == param.VAR_POSITIONAL:
                 return await self._transform_greedy_var_pos(ctx, param, converter.converter)
@@ -539,6 +496,8 @@ class Command(_BaseCommand):
             if required:
                 if self._is_typing_optional(param.annotation):
                     return None
+                if hasattr(converter, '__commands_is_flag__') and converter._can_be_constructible():
+                    return await converter._construct_default(ctx)
                 raise MissingRequiredArgument(param)
             return param.default
 
@@ -549,7 +508,7 @@ class Command(_BaseCommand):
             argument = view.get_quoted_word()
         view.previous = previous
 
-        return await self.do_conversion(ctx, converter, argument, param)
+        return await run_converters(ctx, converter, argument, param)
 
     async def _transform_greedy_pos(self, ctx, param, required, converter):
         view = ctx.view
@@ -561,7 +520,7 @@ class Command(_BaseCommand):
             view.skip_ws()
             try:
                 argument = view.get_quoted_word()
-                value = await self.do_conversion(ctx, converter, argument, param)
+                value = await run_converters(ctx, converter, argument, param)
             except (CommandError, ArgumentParsingError):
                 view.index = previous
                 break
@@ -577,7 +536,7 @@ class Command(_BaseCommand):
         previous = view.index
         try:
             argument = view.get_quoted_word()
-            value = await self.do_conversion(ctx, converter, argument, param)
+            value = await run_converters(ctx, converter, argument, param)
         except (CommandError, ArgumentParsingError):
             view.index = previous
             raise RuntimeError() from None # break loop
@@ -585,22 +544,25 @@ class Command(_BaseCommand):
             return value
 
     @property
-    def clean_params(self):
-        """OrderedDict[:class:`str`, :class:`inspect.Parameter`]:
-        Retrieves the parameter OrderedDict without the context or self parameters.
+    def clean_params(self) -> Dict[str, inspect.Parameter]:
+        """Dict[:class:`str`, :class:`inspect.Parameter`]:
+        Retrieves the parameter dictionary without the context or self parameters.
 
         Useful for inspecting signature.
         """
         result = self.params.copy()
         if self.cog is not None:
             # first parameter is self
-            result.popitem(last=False)
+            try:
+                del result[next(iter(result))]
+            except StopIteration:
+                raise ValueError("missing 'self' parameter") from None
 
         try:
             # first/second parameter is context
-            result.popitem(last=False)
-        except Exception:
-            raise ValueError('Missing context parameter') from None
+            del result[next(iter(result))]
+        except StopIteration:
+            raise ValueError("missing 'context' parameter") from None
 
         return result
 
@@ -621,7 +583,7 @@ class Command(_BaseCommand):
 
     @property
     def parents(self):
-        """List[:class:`Command`]: Retrieves the parents of this command.
+        """List[:class:`Group`]: Retrieves the parents of this command.
 
         If the command has no parents then it returns an empty :class:`list`.
 
@@ -639,7 +601,7 @@ class Command(_BaseCommand):
 
     @property
     def root_parent(self):
-        """Optional[:class:`Command`]: Retrieves the root parent of this command.
+        """Optional[:class:`Group`]: Retrieves the root parent of this command.
 
         If the command has no parents then it returns ``None``.
 
@@ -682,26 +644,25 @@ class Command(_BaseCommand):
             try:
                 next(iterator)
             except StopIteration:
-                fmt = 'Callback for {0.name} command is missing "self" parameter.'
-                raise discord.ClientException(fmt.format(self))
+                raise discord.ClientException(f'Callback for {self.name} command is missing "self" parameter.')
 
         # next we have the 'ctx' as the next parameter
         try:
             next(iterator)
         except StopIteration:
-            fmt = 'Callback for {0.name} command is missing "ctx" parameter.'
-            raise discord.ClientException(fmt.format(self))
+            raise discord.ClientException(f'Callback for {self.name} command is missing "ctx" parameter.')
 
         for name, param in iterator:
-            if param.kind == param.POSITIONAL_OR_KEYWORD:
+            ctx.current_parameter = param
+            if param.kind in (param.POSITIONAL_OR_KEYWORD, param.POSITIONAL_ONLY):
                 transformed = await self.transform(ctx, param)
                 args.append(transformed)
             elif param.kind == param.KEYWORD_ONLY:
                 # kwarg only param denotes "consume rest" semantics
                 if self.rest_is_raw:
-                    converter = self._get_converter(param)
+                    converter = get_converter(param)
                     argument = view.read_rest()
-                    kwargs[name] = await self.do_conversion(ctx, converter, argument, param)
+                    kwargs[name] = await run_converters(ctx, converter, argument, param)
                 else:
                     kwargs[name] = await self.transform(ctx, param)
                 break
@@ -715,9 +676,8 @@ class Command(_BaseCommand):
                     except RuntimeError:
                         break
 
-        if not self.ignore_extra:
-            if not view.eof:
-                raise TooManyArguments('Too many arguments passed to ' + self.qualified_name)
+        if not self.ignore_extra and not view.eof:
+            raise TooManyArguments('Too many arguments passed to ' + self.qualified_name)
 
     async def call_before_hooks(self, ctx):
         # now that we're done preparing we can call the pre-command hooks
@@ -768,27 +728,33 @@ class Command(_BaseCommand):
             dt = ctx.message.edited_at or ctx.message.created_at
             current = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
             bucket = self._buckets.get_bucket(ctx.message, current)
-            retry_after = bucket.update_rate_limit(current)
-            if retry_after:
-                raise CommandOnCooldown(bucket, retry_after)
+            if bucket is not None:
+                retry_after = bucket.update_rate_limit(current)
+                if retry_after:
+                    raise CommandOnCooldown(bucket, retry_after)
 
     async def prepare(self, ctx):
         ctx.command = self
 
         if not await self.can_run(ctx):
-            raise CheckFailure('The check functions for command {0.qualified_name} failed.'.format(self))
-
-        if self.cooldown_after_parsing:
-            await self._parse_arguments(ctx)
-            self._prepare_cooldowns(ctx)
-        else:
-            self._prepare_cooldowns(ctx)
-            await self._parse_arguments(ctx)
+            raise CheckFailure(f'The check functions for command {self.qualified_name} failed.')
 
         if self._max_concurrency is not None:
             await self._max_concurrency.acquire(ctx)
 
-        await self.call_before_hooks(ctx)
+        try:
+            if self.cooldown_after_parsing:
+                await self._parse_arguments(ctx)
+                self._prepare_cooldowns(ctx)
+            else:
+                self._prepare_cooldowns(ctx)
+                await self._parse_arguments(ctx)
+
+            await self.call_before_hooks(ctx)
+        except:
+            if self._max_concurrency is not None:
+                await self._max_concurrency.release(ctx)
+            raise
 
     def is_on_cooldown(self, ctx):
         """Checks whether the command is currently on cooldown.
@@ -899,6 +865,13 @@ class Command(_BaseCommand):
         self.on_error = coro
         return coro
 
+    def has_error_handler(self):
+        """:class:`bool`: Checks whether the command has an error handler registered.
+
+        .. versionadded:: 1.7
+        """
+        return hasattr(self, 'on_error')
+
     def before_invoke(self, coro):
         """A decorator that registers a coroutine as a pre-invoke hook.
 
@@ -962,9 +935,9 @@ class Command(_BaseCommand):
     def short_doc(self):
         """:class:`str`: Gets the "short" documentation of a command.
 
-        By default, this is the :attr:`brief` attribute.
+        By default, this is the :attr:`.brief` attribute.
         If that lookup leads to an empty string then the first line of the
-        :attr:`help` attribute is used instead.
+        :attr:`.help` attribute is used instead.
         """
         if self.brief is not None:
             return self.brief
@@ -973,15 +946,7 @@ class Command(_BaseCommand):
         return ''
 
     def _is_typing_optional(self, annotation):
-        try:
-            origin = annotation.__origin__
-        except AttributeError:
-            return False
-
-        if origin is not typing.Union:
-            return False
-
-        return annotation.__args__[-1] is type(None)
+        return getattr(annotation, '__origin__', None) is Union and type(None) in annotation.__args__
 
     @property
     def signature(self):
@@ -989,37 +954,51 @@ class Command(_BaseCommand):
         if self.usage is not None:
             return self.usage
 
-
         params = self.clean_params
         if not params:
             return ''
 
         result = []
         for name, param in params.items():
-            greedy = isinstance(param.annotation, converters._Greedy)
+            greedy = isinstance(param.annotation, Greedy)
+            optional = False  # postpone evaluation of if it's an optional argument
 
+            # for typing.Literal[...], typing.Optional[typing.Literal[...]], and Greedy[typing.Literal[...]], the
+            # parameter signature is a literal list of it's values
+            annotation = param.annotation.converter if greedy else param.annotation
+            origin = getattr(annotation, '__origin__', None)
+            if not greedy and origin is Union:
+                none_cls = type(None)
+                union_args = annotation.__args__
+                optional = union_args[-1] is none_cls
+                if len(union_args) == 2 and optional:
+                    annotation = union_args[0]
+                    origin = getattr(annotation, '__origin__', None)
+
+            if origin is Literal:
+                name = '|'.join(f'"{v}"' if isinstance(v, str) else str(v) for v in annotation.__args__)
             if param.default is not param.empty:
                 # We don't want None or '' to trigger the [name=value] case and instead it should
                 # do [name] since [name=None] or [name=] are not exactly useful for the user.
                 should_print = param.default if isinstance(param.default, str) else param.default is not None
                 if should_print:
-                    result.append('[%s=%s]' % (name, param.default) if not greedy else
-                                  '[%s=%s]...' % (name, param.default))
+                    result.append(f'[{name}={param.default}]' if not greedy else
+                                  f'[{name}={param.default}]...')
                     continue
                 else:
-                    result.append('[%s]' % name)
+                    result.append(f'[{name}]')
 
             elif param.kind == param.VAR_POSITIONAL:
                 if self.require_var_positional:
-                    result.append('<%s...>' % name)
+                    result.append(f'<{name}...>')
                 else:
-                    result.append('[%s...]' % name)
+                    result.append(f'[{name}...]')
             elif greedy:
-                result.append('[%s]...' % name)
-            elif self._is_typing_optional(param.annotation):
-                result.append('[%s]' % name)
+                result.append(f'[{name}]...')
+            elif optional:
+                result.append(f'[{name}]')
             else:
-                result.append('<%s>' % name)
+                result.append(f'<{name}>')
 
         return ' '.join(result)
 
@@ -1027,7 +1006,7 @@ class Command(_BaseCommand):
         """|coro|
 
         Checks if the command can be executed by checking all the predicates
-        inside the :attr:`checks` attribute. This also checks whether the
+        inside the :attr:`~Command.checks` attribute. This also checks whether the
         command is disabled.
 
         .. versionchanged:: 1.3
@@ -1051,14 +1030,14 @@ class Command(_BaseCommand):
         """
 
         if not self.enabled:
-            raise DisabledCommand('{0.name} command is disabled'.format(self))
+            raise DisabledCommand(f'{self.name} command is disabled')
 
         original = ctx.command
         ctx.command = self
 
         try:
             if not await ctx.bot.can_run(ctx):
-                raise CheckFailure('The global check functions for command {0.qualified_name} failed.'.format(self))
+                raise CheckFailure(f'The global check functions for command {self.qualified_name} failed.')
 
             cog = self.cog
             if cog is not None:
@@ -1140,6 +1119,7 @@ class GroupMixin:
         self.all_commands[command.name] = command
         for alias in command.aliases:
             if alias in self.all_commands:
+                self.remove_command(command.name)
                 raise CommandRegistrationError(alias, alias_conflict=True)
             self.all_commands[alias] = command
 
@@ -1172,7 +1152,12 @@ class GroupMixin:
 
         # we're not removing the alias so let's delete the rest of them.
         for alias in command.aliases:
-            self.all_commands.pop(alias, None)
+            cmd = self.all_commands.pop(alias, None)
+            # in the case of a CommandRegistrationError, an alias might conflict
+            # with an already existing command. If this is the case, we want to
+            # make sure the pre-existing command is not removed.
+            if cmd not in (None, command):
+                self.all_commands[alias] = cmd
         return command
 
     def walk_commands(self):
@@ -1324,6 +1309,8 @@ class Group(GroupMixin, Command):
             injected = hooked_wrapped_callback(self, ctx, self.callback)
             await injected(*ctx.args, **ctx.kwargs)
 
+        ctx.invoked_parents.append(ctx.invoked_with)
+
         if trigger and ctx.invoked_subcommand:
             ctx.invoked_with = trigger
             await ctx.invoked_subcommand.invoke(ctx)
@@ -1361,6 +1348,8 @@ class Group(GroupMixin, Command):
             finally:
                 if call_hooks:
                     await self.call_after_hooks(ctx)
+
+        ctx.invoked_parents.append(ctx.invoked_with)
 
         if trigger and ctx.invoked_subcommand:
             ctx.invoked_with = trigger
@@ -1567,7 +1556,7 @@ def check_any(*checks):
         try:
             pred = wrapped.predicate
         except AttributeError:
-            raise TypeError('%r must be wrapped by commands.check decorator' % wrapped) from None
+            raise TypeError(f'{wrapped!r} must be wrapped by commands.check decorator') from None
         else:
             unwrapped.append(pred)
 
@@ -1755,7 +1744,7 @@ def has_permissions(**perms):
 
     invalid = set(perms) - set(discord.Permissions.VALID_FLAGS)
     if invalid:
-        raise TypeError('Invalid permission(s): %s' % (', '.join(invalid)))
+        raise TypeError(f"Invalid permission(s): {', '.join(invalid)}")
 
     def predicate(ctx):
         ch = ctx.channel
@@ -1780,7 +1769,7 @@ def bot_has_permissions(**perms):
 
     invalid = set(perms) - set(discord.Permissions.VALID_FLAGS)
     if invalid:
-        raise TypeError('Invalid permission(s): %s' % (', '.join(invalid)))
+        raise TypeError(f"Invalid permission(s): {', '.join(invalid)}")
 
     def predicate(ctx):
         guild = ctx.guild
@@ -1808,7 +1797,7 @@ def has_guild_permissions(**perms):
 
     invalid = set(perms) - set(discord.Permissions.VALID_FLAGS)
     if invalid:
-        raise TypeError('Invalid permission(s): %s' % (', '.join(invalid)))
+        raise TypeError(f"Invalid permission(s): {', '.join(invalid)}")
 
     def predicate(ctx):
         if not ctx.guild:
@@ -1833,7 +1822,7 @@ def bot_has_guild_permissions(**perms):
 
     invalid = set(perms) - set(discord.Permissions.VALID_FLAGS)
     if invalid:
-        raise TypeError('Invalid permission(s): %s' % (', '.join(invalid)))
+        raise TypeError(f"Invalid permission(s): {', '.join(invalid)}")
 
     def predicate(ctx):
         if not ctx.guild:
@@ -1938,15 +1927,57 @@ def cooldown(rate, per, type=BucketType.default):
         The number of times a command can be used before triggering a cooldown.
     per: :class:`float`
         The amount of seconds to wait for a cooldown when it's been triggered.
-    type: :class:`.BucketType`
-        The type of cooldown to have.
+    type: Union[:class:`.BucketType`, Callable[[:class:`.Message`], Any]]
+        The type of cooldown to have. If callable, should return a key for the mapping.
+
+        .. versionchanged:: 1.7
+            Callables are now supported for custom bucket types.
     """
 
     def decorator(func):
         if isinstance(func, Command):
-            func._buckets = CooldownMapping(Cooldown(rate, per, type))
+            func._buckets = CooldownMapping(Cooldown(rate, per), type)
         else:
-            func.__commands_cooldown__ = Cooldown(rate, per, type)
+            func.__commands_cooldown__ = CooldownMapping(Cooldown(rate, per), type)
+        return func
+    return decorator
+
+def dynamic_cooldown(cooldown, type=BucketType.default):
+    """A decorator that adds a dynamic cooldown to a :class:`.Command`
+
+    This differs from :func:`.cooldown` in that it takes a function that
+    accepts a single parameter of type :class:`.discord.Message` and must
+    return a :class:`.Cooldown`
+
+    A cooldown allows a command to only be used a specific amount
+    of times in a specific time frame. These cooldowns can be based
+    either on a per-guild, per-channel, per-user, per-role or global basis.
+    Denoted by the third argument of ``type`` which must be of enum
+    type :class:`.BucketType`.
+
+    If a cooldown is triggered, then :exc:`.CommandOnCooldown` is triggered in
+    :func:`.on_command_error` and the local error handler.
+
+    A command can only have a single cooldown.
+
+    .. versionadded:: 2.0
+
+    Parameters
+    ------------
+    cooldown: Callable[[:class:`.discord.Message`], :class:`.Cooldown`]
+        A function that takes a message and returns a cooldown that will
+        apply to this invocation
+    type: :class:`.BucketType`
+        The type of cooldown to have.
+    """
+    if not callable(cooldown):
+        raise TypeError("A callable must be provided")
+
+    def decorator(func):
+        if isinstance(func, Command):
+            func._buckets = DynamicCooldownMapping(cooldown, type)
+        else:
+            func.__commands_cooldown__ = DynamicCooldownMapping(cooldown, type)
         return func
     return decorator
 
@@ -2009,7 +2040,7 @@ def before_invoke(coro):
             @commands.before_invoke(record_usage)
             @commands.command()
             async def when(self, ctx): # Output: <User> used when at <Time>
-                await ctx.send('and i have existed since {}'.format(ctx.bot.user.created_at))
+                await ctx.send(f'and i have existed since {ctx.bot.user.created_at}')
 
             @commands.command()
             async def where(self, ctx): # Output: <Nothing>

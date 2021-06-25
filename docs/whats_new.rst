@@ -11,6 +11,183 @@ Changelog
 This page keeps a detailed human friendly rendering of what's new and changed
 in specific versions.
 
+.. _vp1p7p2:
+
+v1.7.2
+-------
+
+Bug Fixes
+~~~~~~~~~~~
+
+- Fix ``fail_if_not_exists`` causing certain message references to not be usable within :meth:`abc.Messageable.send` and :meth:`Message.reply` (:issue:`6726`)
+- Fix :meth:`Guild.chunk` hanging when the user left the guild. (:issue:`6730`)
+- Fix loop sleeping after final iteration rather than before (:issue:`6744`)
+
+.. _vp1p7p1:
+
+v1.7.1
+-------
+
+Bug Fixes
+~~~~~~~~~~~
+
+- |commands| Fix :meth:`Cog.has_error_handler <ext.commands.Cog.has_error_handler>` not working as intended.
+
+.. _vp1p7p0:
+
+v1.7.0
+--------
+
+This version is mainly for improvements and bug fixes. This is more than likely the last major version in the 1.x series.
+Work after this will be spent on v2.0. As a result, **this is the last version to support Python 3.5**.
+Likewise, **this is the last version to support user bots**.
+
+Development of v2.0 will have breaking changes and support for newer API features.
+
+New Features
+~~~~~~~~~~~~~~
+
+- Add support for stage channels via :class:`StageChannel` (:issue:`6602`, :issue:`6608`)
+- Add support for :attr:`MessageReference.fail_if_not_exists` (:issue:`6484`)
+    - By default, if the message you're replying to doesn't exist then the API errors out.
+      This attribute tells the Discord API that it's okay for that message to be missing.
+
+- Add support for Discord's new permission serialisation scheme.
+- Add an easier way to move channels using :meth:`abc.GuildChannel.move`
+- Add :attr:`Permissions.use_slash_commands`
+- Add :attr:`Permissions.request_to_speak`
+- Add support for voice regions in voice channels via :attr:`VoiceChannel.rtc_region` (:issue:`6606`)
+- Add support for :meth:`PartialEmoji.url_as` (:issue:`6341`)
+- Add :attr:`MessageReference.jump_url` (:issue:`6318`)
+- Add :attr:`File.spoiler` (:issue:`6317`)
+- Add support for passing ``roles`` to :meth:`Guild.estimate_pruned_members` (:issue:`6538`)
+- Allow callable class factories to be used in :meth:`abc.Connectable.play` (:issue:`6478`)
+- Add a way to get mutual guilds from the client's cache via :attr:`User.mutual_guilds` (:issue:`2539`, :issue:`6444`)
+- :meth:`PartialMessage.edit` now returns a full :class:`Message` upon success (:issue:`6309`)
+- Add :attr:`RawMessageUpdateEvent.guild_id` (:issue:`6489`)
+- :class:`AuditLogEntry` is now hashable (:issue:`6495`)
+- :class:`Attachment` is now hashable
+- Add :attr:`Attachment.content_type` attribute (:issue:`6618`)
+- Add support for casting :class:`Attachment` to :class:`str` to get the URL.
+- Add ``seed`` parameter for :class:`Colour.random` (:issue:`6562`)
+    - This only seeds it for one call. If seeding for multiple calls is desirable, use :func:`random.seed`.
+
+- Add a :func:`utils.remove_markdown` helper function (:issue:`6573`)
+- Add support for passing scopes to :func:`utils.oauth_url` (:issue:`6568`)
+- |commands| Add support for ``rgb`` CSS function as a parameter to :class:`ColourConverter <ext.commands.ColourConverter>` (:issue:`6374`)
+- |commands| Add support for converting :class:`StoreChannel` via :class:`StoreChannelConverter <ext.commands.StoreChannelConverter>` (:issue:`6603`)
+- |commands| Add support for stripping whitespace after the prefix is encountered using the ``strip_after_prefix`` :class:`~ext.commands.Bot` constructor parameter.
+- |commands| Add :attr:`Context.invoked_parents <ext.commands.Context.invoked_parents>` to get the aliases a command's parent was invoked with (:issue:`1874`, :issue:`6462`)
+- |commands| Add a converter for :class:`PartialMessage` under :class:`ext.commands.PartialMessageConverter` (:issue:`6308`)
+- |commands| Add a converter for :class:`Guild` under :class:`ext.commands.GuildConverter` (:issue:`6016`, :issue:`6365`)
+- |commands| Add :meth:`Command.has_error_handler <ext.commands.Command.has_error_handler>`
+    - This is also adds :meth:`Cog.has_error_handler <ext.commands.Cog.has_error_handler>`
+- |commands| Allow callable types to act as a bucket key for cooldowns (:issue:`6563`)
+- |commands| Add ``linesep`` keyword argument to :class:`Paginator <ext.commands.Paginator>` (:issue:`5975`)
+- |commands| Allow ``None`` to be passed to :attr:`HelpCommand.verify_checks <ext.commands.HelpCommand.verify_checks>` to only verify in a guild context (:issue:`2008`, :issue:`6446`)
+- |commands| Allow relative paths when loading extensions via a ``package`` keyword argument (:issue:`2465`, :issue:`6445`)
+
+Bug Fixes
+~~~~~~~~~~
+
+- Fix mentions not working if ``mention_author`` is passed in :meth:`abc.Messageable.send` without :attr:`Client.allowed_mentions` set (:issue:`6192`, :issue:`6458`)
+- Fix user created instances of :class:`CustomActivity` triggering an error (:issue:`4049`)
+    - Note that currently, bot users still cannot set a custom activity due to a Discord limitation.
+- Fix :exc:`ZeroDivisionError` being raised from :attr:`VoiceClient.average_latency` (:issue:`6430`, :issue:`6436`)
+- Fix :attr:`User.public_flags` not updating upon edit (:issue:`6315`)
+- Fix :attr:`Message.call` sometimes causing attribute errors (:issue:`6390`)
+- Fix issue resending a file during request retries on newer versions of ``aiohttp`` (:issue:`6531`)
+- Raise an error when ``user_ids`` is empty in :meth:`Guild.query_members`
+- Fix ``__str__`` magic method raising when a :class:`Guild` is unavailable.
+- Fix potential :exc:`AttributeError` when accessing :attr:`VoiceChannel.members` (:issue:`6602`)
+- :class:`Embed` constructor parameters now implicitly convert to :class:`str` (:issue:`6574`)
+- Ensure ``discord`` package is only run if executed as a script (:issue:`6483`)
+- |commands| Fix irrelevant commands potentially being unloaded during cog unload due to failure.
+- |commands| Fix attribute errors when setting a cog to :class:`~.ext.commands.HelpCommand` (:issue:`5154`)
+- |commands| Fix :attr:`Context.invoked_with <ext.commands.Context.invoked_with>` being improperly reassigned during a :meth:`~ext.commands.Context.reinvoke` (:issue:`6451`, :issue:`6462`)
+- |commands| Remove duplicates from :meth:`HelpCommand.get_bot_mapping <ext.commands.HelpCommand.get_bot_mapping>` (:issue:`6316`)
+- |commands| Properly handle positional-only parameters in bot command signatures (:issue:`6431`)
+- |commands| Group signatures now properly show up in :attr:`Command.signature <ext.commands.Command.signature>` (:issue:`6529`, :issue:`6530`)
+
+Miscellaneous
+~~~~~~~~~~~~~~
+
+- User endpoints and all userbot related functionality has been deprecated and will be removed in the next major version of the library.
+- :class:`Permission` class methods were updated to match the UI of the Discord client (:issue:`6476`)
+- ``_`` and ``-`` characters are now stripped when making a new cog using the ``discord`` package (:issue:`6313`)
+
+.. _vp1p6p0:
+
+v1.6.0
+--------
+
+This version comes with support for replies and stickers.
+
+New Features
+~~~~~~~~~~~~~~
+
+- An entirely redesigned documentation. This was the cumulation of multiple months of effort.
+    - There's now a dark theme, feel free to navigate to the cog on the screen to change your setting, though this should be automatic.
+- Add support for :meth:`AppInfo.icon_url_as` and :meth:`AppInfo.cover_image_url_as` (:issue:`5888`)
+- Add :meth:`Colour.random` to get a random colour (:issue:`6067`)
+- Add support for stickers via :class:`Sticker` (:issue:`5946`)
+- Add support for replying via :meth:`Message.reply` (:issue:`6061`)
+    - This also comes with the :attr:`AllowedMentions.replied_user` setting.
+    - :meth:`abc.Messageable.send` can now accept a :class:`MessageReference`.
+    - :class:`MessageReference` can now be constructed by users.
+    - :meth:`Message.to_reference` can now convert a message to a :class:`MessageReference`.
+- Add support for getting the replied to resolved message through :attr:`MessageReference.resolved`.
+- Add support for role tags.
+    - :attr:`Guild.premium_subscriber_role` to get the "Nitro Booster" role (if available).
+    - :attr:`Guild.self_role` to get the bot's own role (if available).
+    - :attr:`Role.tags` to get the role's tags.
+    - :meth:`Role.is_premium_subscriber` to check if a role is the "Nitro Booster" role.
+    - :meth:`Role.is_bot_managed` to check if a role is a bot role (i.e. the automatically created role for bots).
+    - :meth:`Role.is_integration` to check if a role is role created by an integration.
+- Add :meth:`Client.is_ws_ratelimited` to check if the websocket is rate limited.
+    - :meth:`ShardInfo.is_ws_ratelimited` is the equivalent for checking a specific shard.
+- Add support for chunking an :class:`AsyncIterator` through :meth:`AsyncIterator.chunk` (:issue:`6100`, :issue:`6082`)
+- Add :attr:`PartialEmoji.created_at` (:issue:`6128`)
+- Add support for editing and deleting webhook sent messages (:issue:`6058`)
+    - This adds :class:`WebhookMessage` as well to power this behaviour.
+- Add :class:`PartialMessage` to allow working with a message via channel objects and just a message_id (:issue:`5905`)
+    - This is useful if you don't want to incur an extra API call to fetch the message.
+- Add :meth:`Emoji.url_as` (:issue:`6162`)
+- Add support for :attr:`Member.pending` for the membership gating feature.
+- Allow ``colour`` parameter to take ``int`` in :meth:`Guild.create_role` (:issue:`6195`)
+- Add support for ``presences`` in :meth:`Guild.query_members` (:issue:`2354`)
+- |commands| Add support for ``description`` keyword argument in :class:`commands.Cog <ext.commands.Cog>` (:issue:`6028`)
+- |tasks| Add support for calling the wrapped coroutine as a function via ``__call__``.
+
+
+Bug Fixes
+~~~~~~~~~~~
+
+- Raise :exc:`DiscordServerError` when reaching 503s repeatedly (:issue:`6044`)
+- Fix :exc:`AttributeError` when :meth:`Client.fetch_template` is called (:issue:`5986`)
+- Fix errors when playing audio and moving to another channel (:issue:`5953`)
+- Fix :exc:`AttributeError` when voice channels disconnect too fast (:issue:`6039`)
+- Fix stale :class:`User` references when the members intent is off.
+- Fix :func:`on_user_update` not dispatching in certain cases when a member is not cached but the user somehow is.
+- Fix :attr:`Message.author` being overwritten in certain cases during message update.
+    - This would previously make it so :attr:`Message.author` is a :class:`User`.
+- Fix :exc:`UnboundLocalError` for editing ``public_updates_channel`` in :meth:`Guild.edit` (:issue:`6093`)
+- Fix uninitialised :attr:`CustomActivity.created_at` (:issue:`6095`)
+- |commands| Errors during cog unload no longer stops module cleanup (:issue:`6113`)
+- |commands| Properly cleanup lingering commands when a conflicting alias is found when adding commands (:issue:`6217`)
+
+Miscellaneous
+~~~~~~~~~~~~~~~
+
+- ``ffmpeg`` spawned processes no longer open a window in Windows (:issue:`6038`)
+- Update dependencies to allow the library to work on Python 3.9+ without requiring build tools. (:issue:`5984`, :issue:`5970`)
+- Fix docstring issue leading to a SyntaxError in 3.9 (:issue:`6153`)
+- Update Windows opus binaries from 1.2.1 to 1.3.1 (:issue:`6161`)
+- Allow :meth:`Guild.create_role` to accept :class:`int` as the ``colour`` parameter (:issue:`6195`)
+- |commands| :class:`MessageConverter <ext.commands.MessageConverter>` regex got updated to support ``www.`` prefixes (:issue:`6002`)
+- |commands| :class:`UserConverter <ext.commands.UserConverter>` now fetches the API if an ID is passed and the user is not cached.
+- |commands| :func:`max_concurrency <ext.commands.max_concurrency>` is now called before cooldowns (:issue:`6172`)
+
 .. _vp1p5p1:
 
 v1.5.1
